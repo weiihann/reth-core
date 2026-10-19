@@ -109,6 +109,10 @@
 #[macro_use]
 extern crate alloc;
 
+// No direct uses remain; the dependency stays to forward its `std`, `serde` and `arbitrary`
+// features.
+use revm_primitives as _;
+
 /// Re-export of [`quanta::Instant`] for high-resolution timing with minimal overhead.
 #[cfg(feature = "std")]
 pub use quanta::Instant as FastInstant;

@@ -5,7 +5,7 @@ use alloy_primitives::{keccak256, Bytes, B256, U256};
 use alloy_trie::TrieAccount;
 use derive_more::Deref;
 use revm_bytecode::{Bytecode as RevmBytecode, BytecodeDecodeError};
-use revm_state::AccountInfo;
+use revm_state::{AccountInfo, CodeSize};
 
 #[cfg(feature = "reth-codec")]
 /// Identifiers used in [`Compact`](reth_codecs::Compact) encoding of [`Bytecode`].
@@ -25,7 +25,7 @@ pub mod compact_ids {
 
 /// An Ethereum account.
 #[cfg_attr(any(test, feature = "serde"), derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, Eq, Default)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[cfg_attr(feature = "reth-codec", derive(reth_codecs::Compact))]
 #[cfg_attr(feature = "reth-codec", reth_codecs::add_arbitrary_tests(compact))]
@@ -36,6 +36,25 @@ pub struct Account {
     pub balance: U256,
     /// Hash of the account's bytecode.
     pub bytecode_hash: Option<B256>,
+    /// Byte length of the code at `bytecode_hash`, recorded by this node.
+    ///
+    /// `0` means not recorded (rows written before this field) or no code.
+    /// Local cache data: excluded from equality, the trie account, serde and
+    /// any commitment. Must stay the LAST field because `Compact` decoding is
+    /// append-only. A row received from another node must have it zeroed
+    /// before storing.
+    #[cfg_attr(any(test, feature = "serde"), serde(skip))]
+    pub code_size: u64,
+}
+
+/// Equality ignores `code_size`: it is a local cache, and unwind compares
+/// whole accounts to decide whether a row changed.
+impl PartialEq for Account {
+    fn eq(&self, other: &Self) -> bool {
+        self.nonce == other.nonce &&
+            self.balance == other.balance &&
+            self.bytecode_hash == other.bytecode_hash
+    }
 }
 
 impl Account {
@@ -60,7 +79,7 @@ impl Account {
 
     /// Converts the account into a trie account with the given storage root.
     pub fn into_trie_account(self, storage_root: B256) -> TrieAccount {
-        let Self { nonce, balance, bytecode_hash } = self;
+        let Self { nonce, balance, bytecode_hash, .. } = self;
         TrieAccount {
             nonce,
             balance,
@@ -71,15 +90,7 @@ impl Account {
 
     /// Extracts the account information from a [`revm_state::Account`]
     pub fn from_revm_account(revm_account: &revm_state::Account) -> Self {
-        Self {
-            balance: revm_account.info.balance,
-            nonce: revm_account.info.nonce,
-            bytecode_hash: if revm_account.info.code_hash == revm_primitives::KECCAK_EMPTY {
-                None
-            } else {
-                Some(revm_account.info.code_hash)
-            },
-        }
+        Self::from(&revm_account.info)
     }
 }
 
@@ -95,6 +106,7 @@ impl From<TrieAccount> for Account {
             balance: value.balance,
             nonce: value.nonce,
             bytecode_hash: (value.code_hash != KECCAK_EMPTY).then_some(value.code_hash),
+            code_size: 0,
         }
     }
 }
@@ -221,26 +233,29 @@ impl From<&GenesisAccount> for Account {
             nonce: value.nonce.unwrap_or_default(),
             balance: value.balance,
             bytecode_hash: value.code.as_ref().map(keccak256),
+            code_size: value.code.as_ref().map_or(0, |code| code.len() as u64),
         }
     }
 }
 
 impl From<AccountInfo> for Account {
     fn from(revm_acc: AccountInfo) -> Self {
-        Self {
-            balance: revm_acc.balance,
-            nonce: revm_acc.nonce,
-            bytecode_hash: (!revm_acc.is_empty_code_hash()).then_some(revm_acc.code_hash),
-        }
+        Self::from(&revm_acc)
     }
 }
 
 impl From<&AccountInfo> for Account {
     fn from(revm_acc: &AccountInfo) -> Self {
+        let bytecode_hash = (!revm_acc.is_empty_code_hash()).then_some(revm_acc.code_hash);
         Self {
             balance: revm_acc.balance,
             nonce: revm_acc.nonce,
-            bytecode_hash: (!revm_acc.is_empty_code_hash()).then_some(revm_acc.code_hash),
+            bytecode_hash,
+            code_size: if bytecode_hash.is_some() {
+                revm_acc.known_code_size().unwrap_or(0)
+            } else {
+                0
+            },
         }
     }
 }
@@ -253,6 +268,9 @@ impl From<Account> for AccountInfo {
             code_hash: reth_acc.bytecode_hash.unwrap_or(KECCAK_EMPTY),
             code: None,
             account_id: None,
+            code_size: reth_acc
+                .bytecode_hash
+                .and_then(|hash| CodeSize::new(hash, reth_acc.code_size)),
         }
     }
 }
@@ -280,9 +298,110 @@ mod tests {
         assert_eq!(len, 4);
     }
 
+    /// `Compact` bytes of a contract row (nonce 1, balance 1000, code hash `0x11..`) as written
+    /// before `code_size` existed.
+    const PRE_CODE_SIZE_CONTRACT_ROW: [u8; 37] =
+        hex!("21040103e81111111111111111111111111111111111111111111111111111111111111111");
+    /// `Compact` bytes of an EOA row (nonce 2, balance 1000) as written before `code_size`
+    /// existed.
+    const PRE_CODE_SIZE_EOA_ROW: [u8; 5] = hex!("21000203e8");
+
+    fn contract(code_size: u64) -> Account {
+        Account {
+            nonce: 1,
+            balance: U256::from(1000),
+            bytecode_hash: Some(B256::repeat_byte(0x11)),
+            code_size,
+        }
+    }
+
+    #[test]
+    fn pre_code_size_rows_decode_as_unknown() {
+        let (decoded, rest) =
+            Account::from_compact(&PRE_CODE_SIZE_CONTRACT_ROW, PRE_CODE_SIZE_CONTRACT_ROW.len());
+        assert!(rest.is_empty());
+        assert_eq!(decoded, contract(0));
+        assert_eq!(decoded.code_size, 0);
+        assert_eq!(AccountInfo::from(decoded).known_code_size(), None);
+
+        let (decoded, rest) =
+            Account::from_compact(&PRE_CODE_SIZE_EOA_ROW, PRE_CODE_SIZE_EOA_ROW.len());
+        assert!(rest.is_empty());
+        assert_eq!(decoded.nonce, 2);
+        assert_eq!(decoded.balance, U256::from(1000));
+        assert_eq!(decoded.bytecode_hash, None);
+        assert_eq!(decoded.code_size, 0);
+    }
+
+    #[test]
+    fn eoa_row_encoding_is_unchanged() {
+        let eoa =
+            Account { nonce: 2, balance: U256::from(1000), bytecode_hash: None, code_size: 0 };
+        let mut buf = vec![];
+        eoa.to_compact(&mut buf);
+        assert_eq!(buf, PRE_CODE_SIZE_EOA_ROW);
+
+        let mut buf = vec![];
+        contract(0).to_compact(&mut buf);
+        assert_eq!(buf, PRE_CODE_SIZE_CONTRACT_ROW);
+    }
+
+    #[test]
+    fn compact_roundtrip_keeps_code_size() {
+        for code_size in [1, 23, 24_576, u64::MAX] {
+            let mut buf = vec![];
+            let len = contract(code_size).to_compact(&mut buf);
+            assert_eq!(&buf[2..37], &PRE_CODE_SIZE_CONTRACT_ROW[2..], "prefix fields unchanged");
+            let (decoded, rest) = Account::from_compact(&buf, len);
+            assert!(rest.is_empty());
+            assert_eq!(decoded, contract(code_size));
+            assert_eq!(decoded.code_size, code_size);
+        }
+    }
+
+    #[test]
+    fn account_info_round_trip_ties_size_to_hash() {
+        let mut info = AccountInfo::from(contract(7));
+        assert_eq!(info.known_code_size(), Some(7));
+        assert_eq!(Account::from(&info).code_size, 7);
+
+        info.code_hash = B256::repeat_byte(0x22);
+        assert_eq!(info.known_code_size(), None);
+        assert_eq!(Account::from(&info).code_size, 0, "stale size is not stored");
+
+        let code = RevmBytecode::new_raw(Bytes::from_static(&[0x60, 0x00, 0x60, 0x00]));
+        let with_code = AccountInfo::default().with_code_and_hash(code.clone(), code.hash_slow());
+        assert_eq!(Account::from(with_code.clone()).code_size, 4);
+        let revm_account = revm_state::Account { info: with_code, ..Default::default() };
+        assert_eq!(Account::from_revm_account(&revm_account).code_size, 4);
+
+        let eoa_with_record = AccountInfo::default().with_code_size(Some(7));
+        assert_eq!(Account::from(&eoa_with_record).code_size, 0);
+
+        let unhashed = Account { bytecode_hash: None, ..contract(7) };
+        assert_eq!(AccountInfo::from(unhashed).code_size, None);
+    }
+
+    #[test]
+    fn account_eq_ignores_code_size() {
+        assert_eq!(contract(0), contract(7));
+        assert_ne!(contract(7), Account { nonce: 2, ..contract(7) });
+    }
+
+    #[test]
+    fn genesis_and_trie_accounts_measure_code() {
+        let genesis = GenesisAccount::default()
+            .with_code(Some(Bytes::from_static(&[0x60, 0x00, 0x60, 0x00])));
+        assert_eq!(Account::from(&genesis).code_size, 4);
+        assert_eq!(Account::from(&GenesisAccount::default()).code_size, 0);
+
+        let trie = contract(7).into_trie_account(B256::ZERO);
+        assert_eq!(Account::from(trie).code_size, 0);
+    }
+
     #[test]
     fn test_empty_account() {
-        let mut acc = Account { nonce: 0, balance: U256::ZERO, bytecode_hash: None };
+        let mut acc = Account { nonce: 0, balance: U256::ZERO, bytecode_hash: None, code_size: 0 };
         // Nonce 0, balance 0, and bytecode hash set to None is considered empty.
         assert!(acc.is_empty());
 
@@ -335,12 +454,17 @@ mod tests {
     #[test]
     fn test_account_has_bytecode() {
         // Account with no bytecode (None)
-        let acc_no_bytecode = Account { nonce: 1, balance: U256::from(1000), bytecode_hash: None };
+        let acc_no_bytecode =
+            Account { nonce: 1, balance: U256::from(1000), bytecode_hash: None, code_size: 0 };
         assert!(!acc_no_bytecode.has_bytecode(), "Account should not have bytecode");
 
         // Account with bytecode hash set to KECCAK_EMPTY (should have bytecode)
-        let acc_empty_bytecode =
-            Account { nonce: 1, balance: U256::from(1000), bytecode_hash: Some(KECCAK_EMPTY) };
+        let acc_empty_bytecode = Account {
+            nonce: 1,
+            balance: U256::from(1000),
+            bytecode_hash: Some(KECCAK_EMPTY),
+            code_size: 0,
+        };
         assert!(acc_empty_bytecode.has_bytecode(), "Account should have bytecode");
 
         // Account with a non-empty bytecode hash
@@ -348,6 +472,7 @@ mod tests {
             nonce: 1,
             balance: U256::from(1000),
             bytecode_hash: Some(B256::from_slice(&[0x11u8; 32])),
+            code_size: 0,
         };
         assert!(acc_with_bytecode.has_bytecode(), "Account should have bytecode");
     }
@@ -355,12 +480,17 @@ mod tests {
     #[test]
     fn test_account_get_bytecode_hash() {
         // Account with no bytecode (should return KECCAK_EMPTY)
-        let acc_no_bytecode = Account { nonce: 0, balance: U256::ZERO, bytecode_hash: None };
+        let acc_no_bytecode =
+            Account { nonce: 0, balance: U256::ZERO, bytecode_hash: None, code_size: 0 };
         assert_eq!(acc_no_bytecode.get_bytecode_hash(), KECCAK_EMPTY, "Should return KECCAK_EMPTY");
 
         // Account with bytecode hash set to KECCAK_EMPTY
-        let acc_empty_bytecode =
-            Account { nonce: 1, balance: U256::from(1000), bytecode_hash: Some(KECCAK_EMPTY) };
+        let acc_empty_bytecode = Account {
+            nonce: 1,
+            balance: U256::from(1000),
+            bytecode_hash: Some(KECCAK_EMPTY),
+            code_size: 0,
+        };
         assert_eq!(
             acc_empty_bytecode.get_bytecode_hash(),
             KECCAK_EMPTY,
@@ -369,8 +499,12 @@ mod tests {
 
         // Account with a valid bytecode hash
         let bytecode_hash = B256::from_slice(&[0x11u8; 32]);
-        let acc_with_bytecode =
-            Account { nonce: 1, balance: U256::from(1000), bytecode_hash: Some(bytecode_hash) };
+        let acc_with_bytecode = Account {
+            nonce: 1,
+            balance: U256::from(1000),
+            bytecode_hash: Some(bytecode_hash),
+            code_size: 0,
+        };
         assert_eq!(
             acc_with_bytecode.get_bytecode_hash(),
             bytecode_hash,
