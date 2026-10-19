@@ -150,3 +150,10 @@ redundant_pub_crate = "allow"
 significant_drop_in_scrutinee = "allow"
 significant_drop_tightening = "allow"
 too_long_first_doc_paragraph = "allow"
+
+# `AccountInfo::code_size` comes from the weiihann/revm fork. The three crates
+# move together: a git revm-state resolves its path dependencies in the fork.
+[patch.crates-io]
+revm-state = { git = "https://github.com/weiihann/revm", rev = "530c04490021820932bba7deb816cd80258ea3c9" }
+revm-bytecode = { git = "https://github.com/weiihann/revm", rev = "530c04490021820932bba7deb816cd80258ea3c9" }
+revm-primitives = { git = "https://github.com/weiihann/revm", rev = "530c04490021820932bba7deb816cd80258ea3c9" }
